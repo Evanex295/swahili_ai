@@ -110,6 +110,58 @@ def run_ffmpeg(args: list, desc: str = ""):
     return result
 
 
+def parse_translation_json(raw: str) -> dict:
+    """Parser imara wa majibu ya tafsiri. Llama mara nyingine inarudisha:
+      - array safi:        [{"id":0,"sw":"..."}]
+      - object-wrapped:    {"translations":[{"id":0,"sw":"..."}]}
+      - NDJSON:            {"id":0,"sw":"..."}\\n{"id":1,"sw":"..."}
+      - JSON + maelezo ya ziada kuzunguka
+    Hii inashughulikia zote, inarudisha {id: sw}."""
+    import re
+    raw = (raw or "").replace("```json", "").replace("```", "").strip()
+
+    # 1) Array moja kwa moja
+    try:
+        data = json.loads(raw)
+        if isinstance(data, list):
+            return {int(x["id"]): x["sw"] for x in data if "id" in x and "sw" in x}
+        if isinstance(data, dict):
+            if "translations" in data and isinstance(data["translations"], list):
+                return {int(x["id"]): x["sw"] for x in data["translations"]
+                        if "id" in x and "sw" in x}
+            if "id" in data and "sw" in data:        # object moja
+                return {int(data["id"]): data["sw"]}
+    except (json.JSONDecodeError, ValueError, KeyError, TypeError):
+        pass
+
+    # 2) NDJSON / objects nyingi mfululizo — kamata kila {...} yenye id+sw
+    out = {}
+    decoder = json.JSONDecoder()
+    idx, n = 0, len(raw)
+    while idx < n:
+        ch = raw[idx]
+        if ch != "{":
+            idx += 1
+            continue
+        try:
+            obj, end = decoder.raw_decode(raw, idx)
+            if isinstance(obj, dict) and "id" in obj and "sw" in obj:
+                out[int(obj["id"])] = obj["sw"]
+            idx = end
+        except (json.JSONDecodeError, ValueError, KeyError, TypeError):
+            idx += 1
+    if out:
+        return out
+
+    # 3) Regex ya mwisho kabisa
+    for m in re.finditer(r'"id"\s*:\s*(\d+)\s*,\s*"sw"\s*:\s*"((?:[^"\\]|\\.)*)"', raw):
+        try:
+            out[int(m.group(1))] = json.loads(f'"{m.group(2)}"')
+        except (json.JSONDecodeError, ValueError):
+            out[int(m.group(1))] = m.group(2)
+    return out
+
+
 def probe_duration(path: Path) -> float:
     result = subprocess.run(
         [FFPROBE, "-v", "error", "-show_entries", "format=duration",
@@ -392,7 +444,8 @@ class DubbingPipeline:
             "ikibidi, lakini USIPOTEZE maana wala mtiririko wa stori.\n"
             "5. Majina ya watu/mahali yabaki kama yalivyo.\n"
             "6. Rudisha JSON array TUPU TU bila maelezo, bila markdown: "
-            '[{"id": <int>, "sw": "<tafsiri>"}]'
+            '[{"id": <int>, "sw": "<tafsiri>"}]\n'
+            '   au ndani ya object: {"translations": [{"id": <int>, "sw": "..."}]}'
         )
 
         def translate_batch(batch: list, prev_ctx: str, attempt: int = 0) -> dict:
@@ -400,20 +453,24 @@ class DubbingPipeline:
             user_content = ""
             if prev_ctx:
                 user_content += f"(Mistari iliyotangulia kwa muktadha:\n{prev_ctx}\n)\n\n"
-            user_content += "TAFSIRI HII:\n" + "\n".join(
-                f'{{"id": {s["id"]}, "speaker": "{s["speaker"]}", '
-                f'"text": {json.dumps(s["text"])}}}' for s in batch)
+            user_content += (
+                'Rudisha JSON object yenye key "translations" ikiwa na array '
+                "ya tafsiri.\n\nTAFSIRI HII:\n" + "\n".join(
+                    f'{{"id": {s["id"]}, "speaker": "{s["speaker"]}", '
+                    f'"text": {json.dumps(s["text"])}}}' for s in batch))
             try:
                 resp = client.chat.completions.create(
                     model=CONFIG["groq_model"],
                     messages=[{"role": "system", "content": SYSTEM},
                               {"role": "user", "content": user_content}],
-                    max_tokens=4000, temperature=0.5,  # 0.5 = natural zaidi
+                    max_tokens=4000, temperature=0.5,
+                    response_format={"type": "json_object"},  # JSON halali daima
                 )
-                raw = resp.choices[0].message.content.strip()
-                raw = raw.replace("```json", "").replace("```", "").strip()
-                parsed = json.loads(raw)
-                return {item["id"]: item["sw"] for item in parsed}
+                raw = resp.choices[0].message.content
+                mapping = parse_translation_json(raw)
+                if not mapping:
+                    raise ValueError("parser haikupata id/sw yoyote")
+                return mapping
             except Exception as e:
                 if attempt < 2:
                     time.sleep(3 * (attempt + 1))
@@ -426,12 +483,13 @@ class DubbingPipeline:
                             model=CONFIG["groq_model"],
                             messages=[{"role": "system", "content": SYSTEM},
                                       {"role": "user", "content":
-                                       f'[{{"id": {s["id"]}, "text": '
-                                       f'{json.dumps(s["text"])}}}]'}],
-                            max_tokens=300, temperature=0.5)
-                        raw = (r.choices[0].message.content
-                               .replace("```json", "").replace("```", "").strip())
-                        out[s["id"]] = json.loads(raw)[0]["sw"]
+                                       'Rudisha {"translations":[{"id":'
+                                       f'{s["id"]},"sw":"..."}}]}}.\nTAFSIRI: '
+                                       f'{json.dumps(s["text"])}'}],
+                            max_tokens=400, temperature=0.5,
+                            response_format={"type": "json_object"})
+                        m = parse_translation_json(r.choices[0].message.content)
+                        out[s["id"]] = m.get(s["id"], s["text"])
                     except Exception:
                         out[s["id"]] = s["text"]
                     time.sleep(0.5)
