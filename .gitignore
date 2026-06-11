@@ -1,0 +1,23 @@
+# Virtual environment
+venv311/
+venv/
+__pycache__/
+*.pyc
+
+# Models (large downloaded weights)
+models/
+
+# Generated/data outputs
+matokeo/
+sauti_vipande/
+filamu_asili/
+sampuli_wahusika/
+tafsiri/
+sampuli_sauti.wav
+
+# Docs
+ubuntu-ai-doc/
+AI_Dubbing_Pipeline_Complete.docx
+
+# Env files
+.env
