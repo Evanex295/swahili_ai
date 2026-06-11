@@ -229,8 +229,24 @@ class DubbingPipeline:
         diar = pipe({"waveform": torch.tensor(wav, dtype=torch.float32),
                      "sample_rate": sr})
 
+        # pyannote API tofauti kati ya matoleo:
+        #  - 3.1 : pipeline inarudisha Annotation moja kwa moja
+        #  - 4.x : inarudisha DiarizeOutput; Annotation iko ndani ya
+        #          .speaker_diarization (au .diarization kwenye baadhi ya builds)
+        annotation = diar
+        if not hasattr(annotation, "itertracks"):
+            for attr in ("speaker_diarization", "diarization", "annotation"):
+                inner = getattr(annotation, attr, None)
+                if inner is not None and hasattr(inner, "itertracks"):
+                    annotation = inner
+                    break
+        if not hasattr(annotation, "itertracks"):
+            raise RuntimeError(
+                "Diarization output haina itertracks — pyannote API "
+                f"isiyojulikana. Type: {type(diar)}")
+
         speakers: dict = {}
-        for segment, _, spk in diar.itertracks(yield_label=True):
+        for segment, _, spk in annotation.itertracks(yield_label=True):
             speakers.setdefault(spk, []).append(
                 {"start": float(segment.start), "end": float(segment.end)})
 
@@ -321,35 +337,78 @@ class DubbingPipeline:
         if cached:
             print("STEP 5: translation checkpoint ipo — skipping.")
             return cached
-        self._banner("STEP 5: Groq translation (scene-context batches)")
+        self._banner("STEP 5: Groq translation (story-aware, two-pass)")
 
         if not GROQ_API_KEY:
             raise EnvironmentError("GROQ_API_KEY haijawekwa kwenye environment.")
         from groq import Groq
         client = Groq(api_key=GROQ_API_KEY)
 
+        # ── PASS 1: Model isome script NZIMA kwanza, ielewe stori ──
+        # Hii ndiyo fix ya "tafsiri haina uhalisia wa stori": model
+        # inajua wahusika ni nani, mahusiano yao, tone, kabla ya kutafsiri.
+        full_script = "\n".join(
+            f'[{s["speaker"]}]: {s["text"]}' for s in segments)
+
+        context_summary = ""
+        try:
+            ctx_resp = client.chat.completions.create(
+                model=CONFIG["groq_model"],
+                messages=[{
+                    "role": "system",
+                    "content": (
+                        "Wewe ni script analyst wa filamu. Soma dialogue yote "
+                        "hapa chini kisha eleza KWA UFUPI (sentensi 4-6): "
+                        "stori inahusu nini, wahusika ni nani na mahusiano yao, "
+                        "tone ya scene (hasira/mapenzi/vitisho/utani), na "
+                        "namna wanavyozungumza (rasmi au mtaani). Hii itasaidia "
+                        "mtafsiri kutoa Kiswahili chenye uhalisia.")
+                }, {"role": "user", "content": full_script}],
+                max_tokens=500, temperature=0.4,
+            )
+            context_summary = ctx_resp.choices[0].message.content.strip()
+            print("  Story context:")
+            for line in context_summary.split("\n"):
+                if line.strip():
+                    print(f"    {line.strip()}")
+        except Exception as e:
+            print(f"  ! Context pass skipped ({e}) — inaendelea bila muhtasari")
+
+        # ── PASS 2: Tafsiri ikiwa na muktadha wa stori + jirani ──
         SYSTEM = (
-            "Wewe ni mtafsiri mkuu wa filamu (dubbing). Tafsiri dialogue kuwa "
-            "Kiswahili cha mazungumzo ya kawaida ya Tanzania (mtaani lakini safi). "
-            "KANUNI:\n"
-            "1. Hisia za mhusika zibaki kamili: hasira, vicheko, hofu, mapenzi.\n"
-            "2. Idadi ya silabi za tafsiri iwe KARIBU sawa na asili (lip-sync). "
-            "Kama lazima, fupisha bila kupoteza maana.\n"
-            "3. Majina ya watu na mahali yabaki kama yalivyo.\n"
-            "4. Rudisha JSON array TUPU TU: "
-            '[{"id": <int>, "sw": "<tafsiri>"}] — bila maelezo, bila markdown.'
+            "Wewe ni mtafsiri mkuu wa dubbing wa filamu Tanzania. Lengo lako "
+            "ni tafsiri INAYOSIKIKA KAMA BINADAMU HALISI anaongea — sio "
+            "tafsiri ya kamusi (literal). Toa maana na hisia, sio neno kwa neno.\n\n"
+            f"MUKTADHA WA STORI:\n{context_summary}\n\n"
+            "KANUNI MUHIMU:\n"
+            "1. Andika jinsi Mtanzania halisi angesema jambo hilo kwenye "
+            "mazungumzo ya kawaida — natural, sio bandia.\n"
+            "2. Misemo ya Kiingereza ITAFSIRIWE kwa MSEMO sawa wa Kiswahili "
+            "(idiom kwa idiom), SIO neno kwa neno. Mfano: usiseme 'paka "
+            "mdogo' kama maana halisi ni dharau au upendo wa kimzaha.\n"
+            "3. Hisia zibaki: hasira iwe hasira, vitisho viwe vitisho, "
+            "mapenzi yawe mapenzi, utani uwe utani.\n"
+            "4. Urefu uwe KARIBU sawa na asili (kwa lip-sync) — fupisha "
+            "ikibidi, lakini USIPOTEZE maana wala mtiririko wa stori.\n"
+            "5. Majina ya watu/mahali yabaki kama yalivyo.\n"
+            "6. Rudisha JSON array TUPU TU bila maelezo, bila markdown: "
+            '[{"id": <int>, "sw": "<tafsiri>"}]'
         )
 
-        def translate_batch(batch: list, attempt: int = 0) -> dict:
-            lines = "\n".join(
+        def translate_batch(batch: list, prev_ctx: str, attempt: int = 0) -> dict:
+            # Onyesha mistari iliyotangulia ili kuendeleza mtiririko
+            user_content = ""
+            if prev_ctx:
+                user_content += f"(Mistari iliyotangulia kwa muktadha:\n{prev_ctx}\n)\n\n"
+            user_content += "TAFSIRI HII:\n" + "\n".join(
                 f'{{"id": {s["id"]}, "speaker": "{s["speaker"]}", '
                 f'"text": {json.dumps(s["text"])}}}' for s in batch)
             try:
                 resp = client.chat.completions.create(
                     model=CONFIG["groq_model"],
                     messages=[{"role": "system", "content": SYSTEM},
-                              {"role": "user", "content": lines}],
-                    max_tokens=4000, temperature=0.3,
+                              {"role": "user", "content": user_content}],
+                    max_tokens=4000, temperature=0.5,  # 0.5 = natural zaidi
                 )
                 raw = resp.choices[0].message.content.strip()
                 raw = raw.replace("```json", "").replace("```", "").strip()
@@ -358,7 +417,7 @@ class DubbingPipeline:
             except Exception as e:
                 if attempt < 2:
                     time.sleep(3 * (attempt + 1))
-                    return translate_batch(batch, attempt + 1)
+                    return translate_batch(batch, prev_ctx, attempt + 1)
                 print(f"  ! Batch failed ({e}) — fallback per-line")
                 out = {}
                 for s in batch:
@@ -369,25 +428,28 @@ class DubbingPipeline:
                                       {"role": "user", "content":
                                        f'[{{"id": {s["id"]}, "text": '
                                        f'{json.dumps(s["text"])}}}]'}],
-                            max_tokens=300, temperature=0.3)
+                            max_tokens=300, temperature=0.5)
                         raw = (r.choices[0].message.content
                                .replace("```json", "").replace("```", "").strip())
                         out[s["id"]] = json.loads(raw)[0]["sw"]
                     except Exception:
-                        out[s["id"]] = s["text"]   # last resort: keep original
+                        out[s["id"]] = s["text"]
                     time.sleep(0.5)
                 return out
 
         translated, bs = [], CONFIG["translate_batch_size"]
         for i in range(0, len(segments), bs):
             batch = segments[i:i + bs]
-            mapping = translate_batch(batch)
+            # muktadha = mistari 3 ya mwisho iliyotafsiriwa
+            prev_ctx = "\n".join(
+                f'[{t["speaker"]}]: {t["swahili"]}' for t in translated[-3:])
+            mapping = translate_batch(batch, prev_ctx)
             for s in batch:
                 translated.append({**s, "swahili": mapping.get(s["id"], s["text"])})
             done = min(i + bs, len(segments))
             print(f"  [{done}/{len(segments)}] "
                   f"{translated[-1]['swahili'][:55]}")
-            time.sleep(0.5)   # free-tier rate limit cushion
+            time.sleep(0.5)
 
         self._save("translated", translated)
         print(f"✓ Translated {len(translated)} segments")
@@ -477,6 +539,40 @@ class DubbingPipeline:
         return translated
 
     # ════════════════════════════════════════════════════════════
+    # OVERLAP RESOLVER — fix ya wahusika wakibishana pamoja
+    # ════════════════════════════════════════════════════════════
+    def _resolve_overlaps(self, valid: list) -> list:
+        """Wahusika wakiongea kwa wakati mmoja, TTS zao zina-collide
+        zinakuwa kelele. Hapa tunatambua collisions na ku-stagger:
+        segment inayofuata inasukumwa ianze pale iliyotangulia
+        inapoisha (au karibu nayo), ili maneno yasikike — intelligibility
+        ni muhimu zaidi ya perfect sync kwenye dubbing."""
+        valid = sorted(valid, key=lambda s: s["start"])
+        placed = []
+        for seg in valid:
+            tts_dur = probe_duration(Path(seg["tts_path"]))
+            start = seg["start"]
+            if placed:
+                prev = placed[-1]
+                prev_end = prev["place_start"] + prev["place_dur"]
+                # overlap kubwa? (zaidi ya 40% ya segment fupi)
+                overlap = prev_end - start
+                if overlap > 0:
+                    min_dur = min(tts_dur, prev["place_dur"])
+                    if overlap > 0.4 * min_dur:
+                        # stagger: anza baada ya iliyotangulia + pengo dogo
+                        start = prev_end + 0.08
+            seg["place_start"] = start
+            seg["place_dur"] = tts_dur
+            placed.append(seg)
+        n_shifted = sum(
+            1 for s in placed if abs(s["place_start"] - s["start"]) > 0.05)
+        if n_shifted:
+            print(f"  Overlap resolver: {n_shifted} segment(s) zime-stagger "
+                  f"ili kuepuka collision")
+        return placed
+
+    # ════════════════════════════════════════════════════════════
     # STEP 7 — Mix: loudnorm dialogue + ducked background  (FIX #6)
     # ════════════════════════════════════════════════════════════
     def step7_mix(self, translated: list) -> Path:
@@ -485,6 +581,9 @@ class DubbingPipeline:
         valid = [s for s in translated if "tts_path" in s]
         if not valid:
             raise RuntimeError("Hakuna TTS segments — step 6 ilifeli yote.")
+
+        # Resolve overlapping dialogue kabla ya placement
+        valid = self._resolve_overlaps(valid)
 
         # 7a. Dialogue bus: place kila segment kwa adelay, kisha loudnorm
         dialogue = self.audio_dir / "dialogue_sw.wav"
@@ -495,7 +594,7 @@ class DubbingPipeline:
             inputs, filters = [], []
             for j, seg in enumerate(chunk):
                 inputs += ["-i", seg["tts_path"]]
-                delay = int(seg["start"] * 1000)
+                delay = int(seg["place_start"] * 1000)
                 filters.append(f"[{j}]adelay={delay}|{delay}[s{j}]")
             mix_in = "".join(f"[s{j}]" for j in range(len(chunk)))
             filters.append(
