@@ -1,0 +1,12 @@
+# SWAHILI VOICE MASTER v2.0 — Dependencies
+# Kaggle: nyingi tayari zipo; install hizi tu kwenye notebook cell:
+#   !pip install -q faster-whisper demucs pyannote.audio TTS groq
+
+faster-whisper>=1.0.0
+demucs>=4.0.0
+pyannote.audio>=3.1.0
+TTS>=0.22.0
+groq>=0.9.0
+soundfile>=0.12.0
+torch>=2.0.0
+numpy<2.0

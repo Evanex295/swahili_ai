@@ -14,6 +14,10 @@ filamu_asili/
 sampuli_wahusika/
 tafsiri/
 sampuli_sauti.wav
+movies_in/
+output/
+*.wav
+*.mp4
 
 # Docs
 ubuntu-ai-doc/
