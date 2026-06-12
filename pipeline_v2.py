@@ -64,16 +64,19 @@ CONFIG = {
     # Demucs
     "demucs_model": "htdemucs_ft",        # best quality; "htdemucs" = 4x faster
 
-    # Translation (Groq — free tier)
+    # Translation
+    # provider: "gemini" (BORA kwa Kiswahili) au "groq" (haraka, fallback)
+    "translate_provider": "gemini",
+    "gemini_model": "gemini-2.5-flash",   # bora kwa lugha za Kiafrika
     "groq_model": "llama-3.3-70b-versatile",
-    "translate_batch_size": 15,           # segments per API call (scene context)
+    "translate_batch_size": 12,           # segments per API call
 
     # TTS
     "xtts_lang": "es",                    # "es" inasoma Kiswahili bora kuliko "en"
     "min_ref_seconds": 3.0,               # XTTS inahitaji ref >= ~3s
     "max_ref_seconds": 12.0,
     "tempo_min": 0.75,                    # usinyooshe zaidi ya hii (inaharibu sauti)
-    "tempo_max": 1.35,
+    "tempo_max": 1.45,                    # kidogo zaidi = overlap ndogo
 
     # Mix
     "dialogue_lufs": -16,
@@ -98,6 +101,7 @@ def find_binary(name: str, windows_fallback: str) -> str:
 FFMPEG = find_binary("ffmpeg", r"C:\ffmpeg\ffmpeg-8.1-essentials_build\bin\ffmpeg.exe")
 FFPROBE = find_binary("ffprobe", r"C:\ffmpeg\ffmpeg-8.1-essentials_build\bin\ffprobe.exe")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
 
 
@@ -389,87 +393,128 @@ class DubbingPipeline:
         if cached:
             print("STEP 5: translation checkpoint ipo — skipping.")
             return cached
-        self._banner("STEP 5: Groq translation (story-aware, two-pass)")
+        provider = CONFIG["translate_provider"]
+        self._banner(f"STEP 5: Translation ({provider}, story-aware two-pass)")
 
-        if not GROQ_API_KEY:
-            raise EnvironmentError("GROQ_API_KEY haijawekwa kwenye environment.")
-        from groq import Groq
-        client = Groq(api_key=GROQ_API_KEY)
+        # ── Chagua backend ya tafsiri ──
+        # Gemini ni bora ZAIDI kwa Kiswahili. Groq ni fallback ya haraka.
+        use_gemini = provider == "gemini" and GEMINI_API_KEY
+        if provider == "gemini" and not GEMINI_API_KEY:
+            print("  ! GEMINI_API_KEY haipo — inarudi kwa Groq")
+            use_gemini = False
+        if not use_gemini and not GROQ_API_KEY:
+            raise EnvironmentError(
+                "Hakuna API key: weka GEMINI_API_KEY au GROQ_API_KEY.")
 
-        # ── PASS 1: Model isome script NZIMA kwanza, ielewe stori ──
-        # Hii ndiyo fix ya "tafsiri haina uhalisia wa stori": model
-        # inajua wahusika ni nani, mahusiano yao, tone, kabla ya kutafsiri.
+        gemini_client = None
+        groq_client = None
+        if use_gemini:
+            from google import genai
+            gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+        if GROQ_API_KEY:
+            from groq import Groq
+            groq_client = Groq(api_key=GROQ_API_KEY)
+
+        def call_llm(system: str, user: str, max_tokens: int = 4000,
+                     temp: float = 0.5, force_json: bool = True) -> str:
+            """Wrapper: Gemini kwanza, Groq kama fallback."""
+            if use_gemini and gemini_client is not None:
+                try:
+                    from google.genai import types
+                    cfg = types.GenerateContentConfig(
+                        system_instruction=system,
+                        temperature=temp,
+                        max_output_tokens=max_tokens,
+                        response_mime_type=("application/json"
+                                            if force_json else "text/plain"),
+                    )
+                    r = gemini_client.models.generate_content(
+                        model=CONFIG["gemini_model"], contents=user, config=cfg)
+                    return r.text or ""
+                except Exception as e:
+                    if groq_client is None:
+                        raise
+                    print(f"    (Gemini error: {e} — Groq fallback)")
+            # Groq path
+            kwargs = dict(
+                model=CONFIG["groq_model"],
+                messages=[{"role": "system", "content": system},
+                          {"role": "user", "content": user}],
+                max_tokens=max_tokens, temperature=temp)
+            if force_json:
+                kwargs["response_format"] = {"type": "json_object"}
+            return groq_client.chat.completions.create(
+                **kwargs).choices[0].message.content
+
+        # ── PASS 1: elewa stori nzima ──
         full_script = "\n".join(
             f'[{s["speaker"]}]: {s["text"]}' for s in segments)
-
         context_summary = ""
         try:
-            ctx_resp = client.chat.completions.create(
-                model=CONFIG["groq_model"],
-                messages=[{
-                    "role": "system",
-                    "content": (
-                        "Wewe ni script analyst wa filamu. Soma dialogue yote "
-                        "hapa chini kisha eleza KWA UFUPI (sentensi 4-6): "
-                        "stori inahusu nini, wahusika ni nani na mahusiano yao, "
-                        "tone ya scene (hasira/mapenzi/vitisho/utani), na "
-                        "namna wanavyozungumza (rasmi au mtaani). Hii itasaidia "
-                        "mtafsiri kutoa Kiswahili chenye uhalisia.")
-                }, {"role": "user", "content": full_script}],
-                max_tokens=500, temperature=0.4,
-            )
-            context_summary = ctx_resp.choices[0].message.content.strip()
+            context_summary = call_llm(
+                system=(
+                    "Wewe ni script analyst wa filamu. Soma dialogue yote "
+                    "kisha eleza KWA UFUPI (sentensi 4-6): stori inahusu nini, "
+                    "wahusika ni nani na mahusiano yao, tone (hasira/mapenzi/"
+                    "vitisho/utani), na namna wanavyozungumza. Andika kwa "
+                    "Kiswahili."),
+                user=full_script, max_tokens=500, temp=0.4,
+                force_json=False).strip()
             print("  Story context:")
             for line in context_summary.split("\n"):
                 if line.strip():
                     print(f"    {line.strip()}")
         except Exception as e:
-            print(f"  ! Context pass skipped ({e}) — inaendelea bila muhtasari")
+            print(f"  ! Context pass skipped ({e})")
 
-        # ── PASS 2: Tafsiri ikiwa na muktadha wa stori + jirani ──
+        # ── PASS 2: tafsiri — prompt yenye mifano (few-shot) ──
         SYSTEM = (
-            "Wewe ni mtafsiri mkuu wa dubbing wa filamu Tanzania. Lengo lako "
-            "ni tafsiri INAYOSIKIKA KAMA BINADAMU HALISI anaongea — sio "
-            "tafsiri ya kamusi (literal). Toa maana na hisia, sio neno kwa neno.\n\n"
+            "Wewe ni mtafsiri bingwa wa dubbing wa filamu nchini Tanzania. "
+            "Kazi yako: geuza dialogue ya Kiingereza kuwa Kiswahili "
+            "KINACHOSIKIKA KAMA WATU HALISI WANAVYOZUNGUMZA — sio tafsiri ya "
+            "kamusi. Lengo ni mtu akisikiliza ahisi ni filamu ya Kiswahili "
+            "halisi, sio tafsiri.\n\n"
             f"MUKTADHA WA STORI:\n{context_summary}\n\n"
-            "KANUNI MUHIMU:\n"
-            "1. Andika jinsi Mtanzania halisi angesema jambo hilo kwenye "
-            "mazungumzo ya kawaida — natural, sio bandia.\n"
-            "2. Misemo ya Kiingereza ITAFSIRIWE kwa MSEMO sawa wa Kiswahili "
-            "(idiom kwa idiom), SIO neno kwa neno. Mfano: usiseme 'paka "
-            "mdogo' kama maana halisi ni dharau au upendo wa kimzaha.\n"
-            "3. Hisia zibaki: hasira iwe hasira, vitisho viwe vitisho, "
-            "mapenzi yawe mapenzi, utani uwe utani.\n"
-            "4. Urefu uwe KARIBU sawa na asili (kwa lip-sync) — fupisha "
-            "ikibidi, lakini USIPOTEZE maana wala mtiririko wa stori.\n"
+            "KANUNI:\n"
+            "1. FUPISHA. Tumia maneno MACHACHE yanayotosha. Mazungumzo ya "
+            "filamu ni mafupi na yenye nguvu. Epuka maneno ya ziada.\n"
+            "2. Tafsiri MAANA na HISIA, sio neno kwa neno. Misemo geuza kwa "
+            "msemo sawa wa Kiswahili.\n"
+            "3. Weka msisitizo pale palipo na hasira au vitisho (mf. alama '!').\n"
+            "4. Hisia zibaki: vitisho viwe vitisho, mapenzi yawe mapenzi.\n"
             "5. Majina ya watu/mahali yabaki kama yalivyo.\n"
-            "6. Rudisha JSON array TUPU TU bila maelezo, bila markdown: "
-            '[{"id": <int>, "sw": "<tafsiri>"}]\n'
-            '   au ndani ya object: {"translations": [{"id": <int>, "sw": "..."}]}'
+            "6. KAGUA maana: usichanganye maneno yenye sauti sawa "
+            "(mfano: 'kiss' = BUSU, sio kuua).\n\n"
+            "MIFANO YA UBORA UNAOTAKIWA:\n"
+            'EN: "There are other rules you\'ll need to follow."\n'
+            'SW: "Kuna kanuni nyingine utapaswa kuzifuata."\n'
+            'EN: "You\'ll wear what I say, do what I want."\n'
+            'SW: "Utavaa ninachokupa, utafanya ninachotaka."\n'
+            'EN: "Now put this on and follow me to the living room."\n'
+            'SW: "Sasa vaa hii, nifuate sebuleni."\n'
+            'EN: "You\'ll give me a kiss to seal the deal."\n'
+            'SW: "Utanipa busu kuthibitisha makubaliano."\n'
+            'EN: "I told you before, I\'m not anyone\'s property!"\n'
+            'SW: "Nilikwambia mwanzoni, mimi si mali ya mtu!"\n'
+            'EN: "I can be your maid, but not your slave."\n'
+            'SW: "Naweza kuwa mfanyakazi wako wa ndani, lakini si mtumwa."\n'
+            'EN: "I won\'t kiss you no matter what."\n'
+            'SW: "Sitakubusu hata ufanyeje."\n\n'
+            'Rudisha JSON: {"translations": [{"id": <int>, "sw": "<tafsiri>"}]}'
         )
 
         def translate_batch(batch: list, prev_ctx: str, attempt: int = 0) -> dict:
-            # Onyesha mistari iliyotangulia ili kuendeleza mtiririko
             user_content = ""
             if prev_ctx:
-                user_content += f"(Mistari iliyotangulia kwa muktadha:\n{prev_ctx}\n)\n\n"
-            user_content += (
-                'Rudisha JSON object yenye key "translations" ikiwa na array '
-                "ya tafsiri.\n\nTAFSIRI HII:\n" + "\n".join(
-                    f'{{"id": {s["id"]}, "speaker": "{s["speaker"]}", '
-                    f'"text": {json.dumps(s["text"])}}}' for s in batch))
+                user_content += f"(Yaliyotangulia:\n{prev_ctx}\n)\n\n"
+            user_content += "TAFSIRI HIZI (fupi na halisi):\n" + "\n".join(
+                f'{{"id": {s["id"]}, "speaker": "{s["speaker"]}", '
+                f'"text": {json.dumps(s["text"])}}}' for s in batch)
             try:
-                resp = client.chat.completions.create(
-                    model=CONFIG["groq_model"],
-                    messages=[{"role": "system", "content": SYSTEM},
-                              {"role": "user", "content": user_content}],
-                    max_tokens=4000, temperature=0.5,
-                    response_format={"type": "json_object"},  # JSON halali daima
-                )
-                raw = resp.choices[0].message.content
+                raw = call_llm(SYSTEM, user_content, max_tokens=4000, temp=0.6)
                 mapping = parse_translation_json(raw)
                 if not mapping:
-                    raise ValueError("parser haikupata id/sw yoyote")
+                    raise ValueError("parser haikupata id/sw")
                 return mapping
             except Exception as e:
                 if attempt < 2:
@@ -479,35 +524,30 @@ class DubbingPipeline:
                 out = {}
                 for s in batch:
                     try:
-                        r = client.chat.completions.create(
-                            model=CONFIG["groq_model"],
-                            messages=[{"role": "system", "content": SYSTEM},
-                                      {"role": "user", "content":
-                                       'Rudisha {"translations":[{"id":'
-                                       f'{s["id"]},"sw":"..."}}]}}.\nTAFSIRI: '
-                                       f'{json.dumps(s["text"])}'}],
-                            max_tokens=400, temperature=0.5,
-                            response_format={"type": "json_object"})
-                        m = parse_translation_json(r.choices[0].message.content)
+                        raw = call_llm(
+                            SYSTEM,
+                            'Rudisha {"translations":[{"id":'
+                            f'{s["id"]},"sw":"..."}}]}}\nTAFSIRI: '
+                            f'{json.dumps(s["text"])}',
+                            max_tokens=400, temp=0.6)
+                        m = parse_translation_json(raw)
                         out[s["id"]] = m.get(s["id"], s["text"])
                     except Exception:
                         out[s["id"]] = s["text"]
-                    time.sleep(0.5)
+                    time.sleep(0.4)
                 return out
 
         translated, bs = [], CONFIG["translate_batch_size"]
         for i in range(0, len(segments), bs):
             batch = segments[i:i + bs]
-            # muktadha = mistari 3 ya mwisho iliyotafsiriwa
             prev_ctx = "\n".join(
                 f'[{t["speaker"]}]: {t["swahili"]}' for t in translated[-3:])
             mapping = translate_batch(batch, prev_ctx)
             for s in batch:
                 translated.append({**s, "swahili": mapping.get(s["id"], s["text"])})
             done = min(i + bs, len(segments))
-            print(f"  [{done}/{len(segments)}] "
-                  f"{translated[-1]['swahili'][:55]}")
-            time.sleep(0.5)
+            print(f"  [{done}/{len(segments)}] {translated[-1]['swahili'][:55]}")
+            time.sleep(0.4)
 
         self._save("translated", translated)
         print(f"✓ Translated {len(translated)} segments")
@@ -603,8 +643,11 @@ class DubbingPipeline:
         """Wahusika wakiongea kwa wakati mmoja, TTS zao zina-collide
         zinakuwa kelele. Hapa tunatambua collisions na ku-stagger:
         segment inayofuata inasukumwa ianze pale iliyotangulia
-        inapoisha (au karibu nayo), ili maneno yasikike — intelligibility
-        ni muhimu zaidi ya perfect sync kwenye dubbing."""
+        inapoisha. LAKINI tuna-cap drift: kama kusukuma kunampeleka
+        mbali sana na nafasi yake halisi (> MAX_DRIFT), tunaiacha
+        ipishane badala ya kuiweka mbali (kuepuka 'sentensi
+        zinakatikia njiani' na kupoteza sync)."""
+        MAX_DRIFT = 1.2   # sekunde — kikomo cha kusukuma segment
         valid = sorted(valid, key=lambda s: s["start"])
         placed = []
         for seg in valid:
@@ -613,21 +656,24 @@ class DubbingPipeline:
             if placed:
                 prev = placed[-1]
                 prev_end = prev["place_start"] + prev["place_dur"]
-                # overlap kubwa? (zaidi ya 40% ya segment fupi)
                 overlap = prev_end - start
                 if overlap > 0:
                     min_dur = min(tts_dur, prev["place_dur"])
                     if overlap > 0.4 * min_dur:
-                        # stagger: anza baada ya iliyotangulia + pengo dogo
-                        start = prev_end + 0.08
-            seg["place_start"] = start
+                        proposed = prev_end + 0.08
+                        # cap drift: usisukume mbali kupita kiasi
+                        if proposed - seg["start"] <= MAX_DRIFT:
+                            start = proposed
+                        else:
+                            start = seg["start"] + MAX_DRIFT
+            seg["place_start"] = max(0.0, start)
             seg["place_dur"] = tts_dur
             placed.append(seg)
         n_shifted = sum(
             1 for s in placed if abs(s["place_start"] - s["start"]) > 0.05)
         if n_shifted:
             print(f"  Overlap resolver: {n_shifted} segment(s) zime-stagger "
-                  f"ili kuepuka collision")
+                  f"(drift cap {MAX_DRIFT}s)")
         return placed
 
     # ════════════════════════════════════════════════════════════
