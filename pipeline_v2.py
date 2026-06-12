@@ -191,11 +191,14 @@ def atempo_chain(factor: float) -> str:
 
 # ═══════════════════════════════════════════════════════════════
 class DubbingPipeline:
-    def __init__(self, input_movie: str, output_dir: str):
+    def __init__(self, input_movie: str, output_dir: str,
+                 translation_override: str = "", export_only: bool = False):
         self.input_movie = Path(input_movie)
         if not self.input_movie.exists():
             raise FileNotFoundError(f"Movie haipo: {input_movie}")
 
+        self.translation_override = translation_override
+        self.export_only = export_only
         self.movie_name = self.input_movie.stem
         self.work = Path(output_dir) / self.movie_name
         self.audio_dir = self.work / "audio"
@@ -221,6 +224,73 @@ class DubbingPipeline:
             with open(p, encoding="utf-8") as f:
                 return json.load(f)
         return None
+
+    # ── HUMAN-IN-THE-LOOP: export script ya kurekebisha ──────────
+    def export_editable_script(self, translated: list) -> Path:
+        """Andika script ya ID-anchored ambayo mtu anaweza kurekebisha.
+        Kila segment ina [id], muda, speaker, English (reference), na
+        SW (draft ya kurekebisha). Rekebisha mistari ya 'SW:' tu —
+        usiguse [id] tags ili alignment ibaki sahihi."""
+        path = self.work / "translation_edit.txt"
+        lines = [
+            "# ════════════════════════════════════════════════════════",
+            "# SCRIPT YA KUREKEBISHA TAFSIRI — Swahili Voice Master",
+            "# ════════════════════════════════════════════════════════",
+            "# MAELEKEZO:",
+            "#  - Rekebisha mistari ya 'SW:' TU (tafsiri ya Kiswahili).",
+            "#  - USIGUSE [id] tags wala mistari ya 'EN:' — ni reference.",
+            "#  - Unaweza kuacha mstari kama ulivyo kama uko sawa.",
+            "#  - Hifadhi file, kisha run pipeline na:",
+            "#       --translation translation_edit.txt",
+            "# ════════════════════════════════════════════════════════",
+            "",
+        ]
+        for s in translated:
+            ts = f'{int(s["start"]//60):02d}:{s["start"]%60:05.2f}'
+            lines.append(f'[{s["id"]}] ({ts}) {s["speaker"]}')
+            lines.append(f'    EN: {s["text"]}')
+            lines.append(f'    SW: {s.get("swahili", "")}')
+            lines.append("")
+        path.write_text("\n".join(lines), encoding="utf-8")
+        return path
+
+    def load_translation_override(self) -> dict:
+        """Soma file ya kurekebishwa, rudisha {id: sw}. Inakubali:
+          [3] SW: maandishi          (format yetu rasmi)
+          [3] maandishi              (rahisi)
+          3: maandishi  /  3 | maandishi
+        Mistari ya '#', 'EN:', na tupu zinapuuzwa."""
+        import re
+        path = Path(self.translation_override)
+        if not path.exists():
+            raise FileNotFoundError(
+                f"Translation override haipo: {self.translation_override}")
+        overrides, cur_id = {}, None
+        for raw in path.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or line.upper().startswith("EN:"):
+                continue
+            # [id] SW: text   au   [id] text
+            m = re.match(r"^\[(\d+)\]\s*(?:SW:)?\s*(.*)$", line, re.IGNORECASE)
+            if m:
+                cur_id = int(m.group(1))
+                txt = m.group(2).strip()
+                if txt:
+                    overrides[cur_id] = txt
+                continue
+            # "    SW: text" inayofuata [id] kwenye mstari uliopita
+            m2 = re.match(r"^SW:\s*(.*)$", line, re.IGNORECASE)
+            if m2 and cur_id is not None:
+                overrides[cur_id] = m2.group(1).strip()
+                continue
+            # id: text  au  id | text
+            m3 = re.match(r"^(\d+)\s*[:|]\s*(.*)$", line)
+            if m3:
+                overrides[int(m3.group(1))] = m3.group(2).strip()
+        return {k: v for k, v in overrides.items() if v}
+
+    def _banner_load(self):
+        pass
 
     def _banner(self, msg: str):
         print(f"\n{'═' * 62}\n {msg}\n{'═' * 62}")
@@ -393,6 +463,28 @@ class DubbingPipeline:
         if cached:
             print("STEP 5: translation checkpoint ipo — skipping.")
             return cached
+
+        # ── HUMAN OVERRIDE: kama script ya kurekebishwa imetolewa ──
+        overrides = {}
+        if self.translation_override:
+            overrides = self.load_translation_override()
+            print(f"STEP 5: Override script — {len(overrides)} tafsiri za "
+                  f"binadamu zimepatikana")
+            # kama overrides zinafunika SEGMENTS ZOTE → ruka AI kabisa
+            if all(s["id"] in overrides for s in segments):
+                self._banner("STEP 5: Tafsiri ya binadamu (AI imerukwa)")
+                translated = [{**s, "swahili": overrides[s["id"]]}
+                              for s in segments]
+                self._save("translated", translated)
+                self.export_editable_script(translated)
+                print(f"✓ Tafsiri zote {len(translated)} zimetoka kwa script "
+                      f"yako ya kurekebishwa")
+                return translated
+            else:
+                missing = [s["id"] for s in segments if s["id"] not in overrides]
+                print(f"  Override haijakamilika — segments {missing} "
+                      f"zitatafsiriwa na AI, nyingine zitatumia zako")
+
         provider = CONFIG["translate_provider"]
         self._banner(f"STEP 5: Translation ({provider}, story-aware two-pass)")
 
@@ -544,13 +636,18 @@ class DubbingPipeline:
                 f'[{t["speaker"]}]: {t["swahili"]}' for t in translated[-3:])
             mapping = translate_batch(batch, prev_ctx)
             for s in batch:
-                translated.append({**s, "swahili": mapping.get(s["id"], s["text"])})
+                # override ya binadamu inashinda AI kama ipo
+                sw = overrides.get(s["id"], mapping.get(s["id"], s["text"]))
+                translated.append({**s, "swahili": sw})
             done = min(i + bs, len(segments))
             print(f"  [{done}/{len(segments)}] {translated[-1]['swahili'][:55]}")
             time.sleep(0.4)
 
         self._save("translated", translated)
+        edit_path = self.export_editable_script(translated)
         print(f"✓ Translated {len(translated)} segments")
+        print(f"📝 Script ya kurekebisha: {edit_path}")
+        print("   (Rekebisha mistari ya SW:, kisha run na --translation)")
         return translated
 
     # ════════════════════════════════════════════════════════════
@@ -757,6 +854,16 @@ class DubbingPipeline:
         speakers = self.step3_diarize()
         segments = self.step4_transcribe(speakers)
         translated = self.step5_translate(segments)
+
+        # export_only: simama baada ya tafsiri, toa script ya kurekebisha
+        if self.export_only:
+            edit_path = self.export_editable_script(translated)
+            self._banner("✅ DRAFT TAYARI — rekebisha kisha run tena")
+            print(f"📝 Script: {edit_path}")
+            print("   1. Download na rekebisha mistari ya 'SW:'")
+            print("   2. Run tena na: --translation translation_edit.txt")
+            return edit_path
+
         translated = self.step6_tts(translated, speakers)
         final = self.step7_mix(translated)
         mins = (time.time() - t0) / 60
@@ -768,5 +875,15 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Swahili Voice Master v2.0")
     ap.add_argument("--input", required=True, help="Path ya movie (mp4/mkv)")
     ap.add_argument("--output", required=True, help="Output directory")
+    ap.add_argument("--translation", default="",
+                    help="Path ya script ya kurekebishwa (translation_edit.txt). "
+                         "Ikitolewa, tafsiri zako zitatumika badala ya AI.")
+    ap.add_argument("--export-script", action="store_true",
+                    help="Simama baada ya tafsiri, toa script ya kurekebisha tu "
+                         "(hakuna TTS wala video).")
     args = ap.parse_args()
-    DubbingPipeline(args.input, args.output).run()
+    DubbingPipeline(
+        args.input, args.output,
+        translation_override=args.translation,
+        export_only=args.export_script,
+    ).run()
